@@ -17,6 +17,7 @@
 
 [Packages]
   MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
   UniXNUPkg/UniXNUPkg.dec
 
 [LibraryClasses]
@@ -34,6 +35,8 @@
   gEfiSimpleFileSystemProtocolGuid ## CONSUMES
   gEfiLoadedImageProtocolGuid ## CONSUMES
   gEfiGraphicsOutputProtocolGuid ## CONSUMES
+  gEfiBlockIoProtocolGuid ## CONSUMES
 
 [Guids]
   gEfiFileInfoGuid
+  gUkeMemStatusGuid

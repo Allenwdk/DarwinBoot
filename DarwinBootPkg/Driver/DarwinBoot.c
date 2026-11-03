@@ -12,6 +12,8 @@
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleFileSystem.h>
+#include <Protocol/BlockIo.h>
+#include <UkeMemStatus.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
@@ -44,6 +46,8 @@ VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
+STATIC UINTN mAdtFailLine;
+STATIC BOOLEAN AdtFail (UINTN Line) { mAdtFailLine = Line; return FALSE; }
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
 
 STATIC
@@ -97,11 +101,27 @@ ReadFile (
     goto Done;
   }
   *Size = (UINTN)Info->FileSize;
-  *Data = AllocatePool (*Size);
+  /* Zeroed: a tail the FAT read never fills then reads as 0, not as leftover pool bytes. */
+  *Data = AllocateZeroPool (*Size);
   if (*Data == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
-  Actual = *Size;
-  Status = File->Read (File, &Actual, *Data);
-  if (!EFI_ERROR (Status) && (Actual != *Size)) { Status = EFI_DEVICE_ERROR; }
+  /*
+   * Bound individual FAT read requests and handle short reads. The earlier Uke tail-corruption
+   * diagnosis was superseded by the ABL handoff / DXE heap overlap finding; the caller still
+   * receives either the complete file or an explicit error.
+   */
+  {
+    UINT8 *Cursor = (UINT8 *)*Data;
+    UINTN Left = *Size;
+    Status = EFI_SUCCESS;
+    while (Left != 0) {
+      Actual = Left > SIZE_64KB ? SIZE_64KB : Left;
+      Status = File->Read (File, &Actual, Cursor);
+      if (EFI_ERROR (Status) || (Actual == 0)) { break; }
+      Cursor += Actual;
+      Left -= Actual;
+    }
+    if (!EFI_ERROR (Status) && (Left != 0)) { Status = EFI_DEVICE_ERROR; }
+  }
 Done:
   if (Info != NULL) { FreePool (Info); }
   File->Close (File);
@@ -289,49 +309,49 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   AddonCandidate = MAX_UINTN;
   PolicyCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
-  if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
+  if ((Depth > 64) || (Size - *Offset < 8)) { return AdtFail (__LINE__); }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
   *Offset += 8;
-  if (Properties > (Size - *Offset) / 36) { return FALSE; }
+  if (Properties > (Size - *Offset) / 36) { return AdtFail (__LINE__); }
   for (Index = 0; Index < Properties; Index++) {
-    if (Size - *Offset < 36) { return FALSE; }
-    if (ScanMem8 (Data + *Offset, 32, 0) == NULL) { return FALSE; }
+    if (Size - *Offset < 36) { return AdtFail (__LINE__); }
+    if (ScanMem8 (Data + *Offset, 32, 0) == NULL) { return AdtFail (__LINE__); }
     Length = U32 (Data + *Offset + 32);
     *Offset += 36;
-    if (Length > Size - *Offset) { return FALSE; }
+    if (Length > Size - *Offset) { return AdtFail (__LINE__); }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "name") == 0) {
-      if (Name != NULL) { return FALSE; }
+      if (Name != NULL) { return AdtFail (__LINE__); }
       Name = Data + *Offset;
       NameLength = Length;
     }
     if ((AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "RAMDisk") == 0) ||
         (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "PackedRAMDisk") == 0)) {
       if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "PackedRAMDisk") == 0) {
-        if (*KeepPacked) { return FALSE; }
+        if (*KeepPacked) { return AdtFail (__LINE__); }
         *KeepPacked = TRUE;
       }
-      if ((Candidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      if ((Candidate != MAX_UINTN) || (Length != 16)) { return AdtFail (__LINE__); }
       Candidate = *Offset;
     }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "TrustCache") == 0) {
-      if ((TrustCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      if ((TrustCandidate != MAX_UINTN) || (Length != 16)) { return AdtFail (__LINE__); }
       TrustCandidate = *Offset;
     }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "GpuAddon") == 0) {
-      if ((AddonCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      if ((AddonCandidate != MAX_UINTN) || (Length != 16)) { return AdtFail (__LINE__); }
       AddonCandidate = *Offset;
     }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "RootPolicies") == 0) {
-      if ((PolicyCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      if ((PolicyCandidate != MAX_UINTN) || (Length != 16)) { return AdtFail (__LINE__); }
       PolicyCandidate = *Offset;
     }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
-      if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+      if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return AdtFail (__LINE__); }
       MemoryCandidate = *Offset;
     }
     *Offset += Length;
-    if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
+    if (ALIGN_VALUE (*Offset, 4) > Size) { return AdtFail (__LINE__); }
     *Offset = ALIGN_VALUE (*Offset, 4);
   }
   Path = 3;
@@ -339,29 +359,29 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   if ((Depth == 1) && (ParentPath == 0) && (NameLength == 7) && (CompareMem (Name, "chosen", 7) == 0)) { Path = 1; }
   if ((Depth == 2) && (ParentPath == 1) && (NameLength == 11) && (CompareMem (Name, "memory-map", 11) == 0)) { Path = 2; }
   if ((Path == 2) && (Candidate != MAX_UINTN)) {
-    if (*RamdiskOffset != MAX_UINTN) { return FALSE; }
+    if (*RamdiskOffset != MAX_UINTN) { return AdtFail (__LINE__); }
     *RamdiskOffset = Candidate;
   }
   if ((Path == 2) && (TrustCandidate != MAX_UINTN)) {
-    if (*TrustCacheOffset != MAX_UINTN) { return FALSE; }
+    if (*TrustCacheOffset != MAX_UINTN) { return AdtFail (__LINE__); }
     *TrustCacheOffset = TrustCandidate;
   }
   if ((Path == 2) && (AddonCandidate != MAX_UINTN)) {
-    if (*AddonOffset != MAX_UINTN) { return FALSE; }
+    if (*AddonOffset != MAX_UINTN) { return AdtFail (__LINE__); }
     *AddonOffset = AddonCandidate;
   }
   if (PolicyCandidate != MAX_UINTN) {
-    if ((Path != 2) || (*PolicyOffset != MAX_UINTN)) { return FALSE; }
+    if ((Path != 2) || (*PolicyOffset != MAX_UINTN)) { return AdtFail (__LINE__); }
     *PolicyOffset = PolicyCandidate;
   }
   if (MemoryCandidate != MAX_UINTN) {
-    if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
+    if ((Path != 1) || (*WindowSize != 0)) { return AdtFail (__LINE__); }
     *WindowSize = U64 (Data + MemoryCandidate);
-    if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
+    if (!DarwinWindowSizeValid (*WindowSize)) { return AdtFail (__LINE__); }
   }
-  if (Children > (Size - *Offset) / 8) { return FALSE; }
+  if (Children > (Size - *Offset) / 8) { return AdtFail (__LINE__); }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return AdtFail (__LINE__); }
   }
   return TRUE;
 }
@@ -377,20 +397,20 @@ ValidTrustCaches (CONST UINT8 *Data, UINTN Size)
   UINTN Entries;
   UINTN Entry;
 
-  if (Size < 8) { return FALSE; }
+  if (Size < 8) { return AdtFail (__LINE__); }
   Count = U32 (Data);
-  if ((Count == 0) || (Count > 128) || (Count > (Size - 4) / 4)) { return FALSE; }
+  if ((Count == 0) || (Count > 128) || (Count > (Size - 4) / 4)) { return AdtFail (__LINE__); }
   for (Index = 0; Index < Count; Index++) {
     Start = U32 (Data + 4 + Index * 4);
     End = (Index + 1 < Count) ? U32 (Data + 8 + Index * 4) : Size;
     if ((Start < 4 + Count * 4) || (Start & 3) || (End > Size) ||
-        (End < Start) || (End - Start < 24) || (U32 (Data + Start) != 2)) { return FALSE; }
+        (End < Start) || (End - Start < 24) || (U32 (Data + Start) != 2)) { return AdtFail (__LINE__); }
     Entries = U32 (Data + Start + 20);
-    if ((Entries > (End - Start - 24) / 24) || (End - Start != 24 + Entries * 24)) { return FALSE; }
+    if ((Entries > (End - Start - 24) / 24) || (End - Start != 24 + Entries * 24)) { return AdtFail (__LINE__); }
     for (Entry = 0; Entry < Entries; Entry++) {
       CONST UINT8 *Hash = Data + Start + 24 + Entry * 24;
       if ((Hash[20] < 1) || (Hash[20] > 4) ||
-          ((Entry != 0) && (CompareMem (Hash - 24, Hash, 20) >= 0))) { return FALSE; }
+          ((Entry != 0) && (CompareMem (Hash - 24, Hash, 20) >= 0))) { return AdtFail (__LINE__); }
     }
   }
   return TRUE;
@@ -547,6 +567,18 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
 }
 
 STATIC
+VOID
+DiagHang (
+  IN CONST CHAR16 *Text
+  )
+{
+  DiagDraw (Text, 0);
+  for (;;) {
+    __asm__ __volatile__ ("yield");
+  }
+}
+
+STATIC
 EFI_STATUS
 EFIAPI
 Boot (
@@ -598,6 +630,7 @@ Boot (
   UINT32                          Version;
   UINTN                           Attempt;
   CHAR8                           CommandLine[1024];
+  CHAR16                          Line[160];
   UINT64                          Video[6];
 
   (VOID)This;
@@ -637,16 +670,63 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
-  Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
-  if (EFI_ERROR (Status)) { goto Fail; }
-  Status = ParseKernel (Image, ImageSize, &Kernel);
-  if (EFI_ERROR (Status)) { goto Fail; }
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
+  if (EFI_ERROR (Status)) { goto Fail; }
+  CopyMem (TreePath, Request->KernelPath, Length);
+  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
+  Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
+  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
+  CopyMem (TreePath, Request->KernelPath, Length);
+  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".vroot");
+  Status = ReadFile (Root, TreePath, SIZE_128MB, &Policies, &PolicySize);
+  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
+  /*
+   * The kernel may be split into .0/.1 parts: this board's loader reads back stale bytes past ~90 MiB
+   * of the FAT volume, so each part stays under that. Read the parts and join them.
+   */
+  {
+    CHAR16 PartPath[256];
+    UINTN  Part;
+    VOID   *PartData;
+    UINTN  PartSize;
+    Image = NULL;
+    ImageSize = 0;
+    for (Part = 0; Part < 2; Part++) {
+      CopyMem (PartPath, Request->KernelPath, Length);
+      /* Length is StrSize: it includes the terminator, so the '.' takes the terminator's slot. */
+      PartPath[Length / sizeof (CHAR16) - 1] = L'.';
+      PartPath[Length / sizeof (CHAR16)] = (CHAR16)(L'0' + Part);
+      PartPath[Length / sizeof (CHAR16) + 1] = 0;
+      Status = ReadFile (Root, PartPath, SIZE_128MB, &PartData, &PartSize);
+      if (EFI_ERROR (Status)) {
+        if (Part == 1 && Status == EFI_NOT_FOUND) {
+          break;                       /* an unsplit kernel, already read as part 0 */
+        }
+        if (Part == 0) { goto Fail; }
+        break;
+      }
+      if (Image == NULL) {
+        Image = PartData;
+        ImageSize = PartSize;
+      } else {
+        UINT8 *Joined = AllocateZeroPool (ImageSize + PartSize);
+        if (Joined == NULL) { FreePool (PartData); Status = EFI_OUT_OF_RESOURCES; goto Fail; }
+        CopyMem (Joined, Image, ImageSize);
+        CopyMem (Joined + ImageSize, PartData, PartSize);
+        FreePool (Image);
+        FreePool (PartData);
+        Image = Joined;
+        ImageSize += PartSize;
+      }
+    }
+    if (Image == NULL) { goto Fail; }
+  }
+  Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
@@ -655,30 +735,44 @@ Boot (
   PolicyOffset = MAX_UINTN;
   WindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
-  if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) {
+    UnicodeSPrint (Line, sizeof (Line), L"ADT l=%u off=%lx sz=%lx w=%x,%x,%x,%x",
+                   (UINT32)mAdtFailLine, (UINT64)Offset, (UINT64)TreeSize,
+                   U32 (Tree), U32 ((UINT8 *)Tree + 4), U32 ((UINT8 *)Tree + 8), U32 ((UINT8 *)Tree + 12));
+    DiagHang (Line);
+  }
+  if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) {
+    UnicodeSPrint (Line, sizeof (Line), L"KEEP rp=%u rd=%lx rs=%lx",
+                   (UINT32)RamdiskPacked, (UINT64)RamdiskOffset, (UINT64)Request->RamdiskSize);
+    DiagHang (Line);
+  }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
   if (Request->Ramdisk != NULL) {
     if ((RamdiskOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + RamdiskOffset) != 0) ||
-        (U64 ((UINT8 *)Tree + RamdiskOffset + 8) != 0)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+        (U64 ((UINT8 *)Tree + RamdiskOffset + 8) != 0)) {
+      UnicodeSPrint (Line, sizeof (Line), L"RD off=%lx v0=%lx v8=%lx", (UINT64)RamdiskOffset,
+                     (RamdiskOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + RamdiskOffset),
+                     (RamdiskOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + RamdiskOffset + 8));
+      DiagHang (Line);
+    }
   } else if (RamdiskOffset != MAX_UINTN) {
     Status = EFI_UNSUPPORTED;
     goto Fail;
   }
-  CopyMem (TreePath, Request->KernelPath, Length);
-  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
-  Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
-  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
   if (TrustCaches != NULL) {
     if ((TrustCacheOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + TrustCacheOffset) != 0) ||
         (U64 ((UINT8 *)Tree + TrustCacheOffset + 8) != 0) || !ValidTrustCaches (TrustCaches, TrustCacheSize)) {
-      Status = EFI_COMPROMISED_DATA;
-      goto Fail;
+      UnicodeSPrint (Line, sizeof (Line), L"TC off=%lx sz=%lx m0=%lx m8=%lx ok=%u", (UINT64)TrustCacheOffset,
+                     (UINT64)TrustCacheSize,
+                     (TrustCacheOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + TrustCacheOffset),
+                     (TrustCacheOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + TrustCacheOffset + 8),
+                     ValidTrustCaches (TrustCaches, TrustCacheSize) ? 1 : 0);
+      DiagHang (Line);
     }
   } else if (TrustCacheOffset != MAX_UINTN) {
-    Status = EFI_COMPROMISED_DATA;
-    goto Fail;
+    UnicodeSPrint (Line, sizeof (Line), L"TC MISS off=%lx", (UINT64)TrustCacheOffset);
+    DiagHang (Line);
   }
   //
   // The GPU addon (kernel.macho.gpuaddon, scripts/make-gpu-addon.py): files the kernel writes into the Data volume before its addon
@@ -691,31 +785,34 @@ Boot (
   if (Addon != NULL) {
     if ((AddonOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + AddonOffset) != 0) || (U64 ((UINT8 *)Tree + AddonOffset + 8) != 0) ||
         (AddonSize < 24) || (CompareMem (Addon, "NGPUADD2", 8) != 0) || (U64 ((UINT8 *)Addon + 16) != AddonSize)) {
-      Status = EFI_COMPROMISED_DATA;
-      goto Fail;
+      UnicodeSPrint (Line, sizeof (Line), L"AD off=%lx sz=%lx m0=%lx m8=%lx",
+                     (UINT64)AddonOffset, (UINT64)AddonSize,
+                     (AddonOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + AddonOffset),
+                     (AddonOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + AddonOffset + 8));
+      DiagHang (Line);
     }
   } else if (AddonOffset != MAX_UINTN) {
-    Status = EFI_COMPROMISED_DATA;
-    goto Fail;
+    UnicodeSPrint (Line, sizeof (Line), L"AD MISS off=%lx", (UINT64)AddonOffset);
+    DiagHang (Line);
   }
   // Root hash tables live outside the kernel's coalesced constant segments.
   // The kernel authenticates each envelope against its compiled owner anchor.
-  CopyMem (TreePath, Request->KernelPath, Length);
-  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".vroot");
-  Status = ReadFile (Root, TreePath, SIZE_128MB, &Policies, &PolicySize);
-  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
   if (Policies != NULL) {
     if ((PolicyOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + PolicyOffset) != 0) ||
         (U64 ((UINT8 *)Tree + PolicyOffset + 8) != 0) || (PolicySize < 32) ||
         (CompareMem (Policies, "VROOTB01", 8) != 0) || (U64 ((UINT8 *)Policies + 8) != 1) ||
         (U64 ((UINT8 *)Policies + 16) == 0) || (U64 ((UINT8 *)Policies + 16) > 16) ||
         (U64 ((UINT8 *)Policies + 24) != PolicySize)) {
-      Status = EFI_COMPROMISED_DATA;
-      goto Fail;
+      UnicodeSPrint (Line, sizeof (Line), L"POL off=%lx sz=%lx m0=%lx m8=%lx mgk=%x",
+                     (UINT64)PolicyOffset, (UINT64)PolicySize,
+                     (PolicyOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + PolicyOffset),
+                     (PolicyOffset == MAX_UINTN) ? 0 : U64 ((UINT8 *)Tree + PolicyOffset + 8),
+                     (UINT32)U64 (Policies));
+      DiagHang (Line);
     }
   } else if (PolicyOffset != MAX_UINTN) {
-    Status = EFI_COMPROMISED_DATA;
-    goto Fail;
+    UnicodeSPrint (Line, sizeof (Line), L"POL MISS off=%lx", (UINT64)PolicyOffset);
+    DiagHang (Line);
   }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
@@ -775,6 +872,119 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset), PolicyAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset + 8), PolicySize);
     FreePool (Policies); Policies = NULL;
+  }
+  /*
+   * Bring-up sampler: does the kernel read buffer and the copied window hold the collection's bytes at known
+   * file offsets? 0x5f67c rodata text, 0x5a14008 a chain word in __static_if, 0x5acfa90 the __static_ifinit
+   * pointers. The expected values are read from the same kernel.macho on the host.
+   */
+  {
+    CHAR16 Probe[160];
+    UINT64 Crc = 0;
+    UINT64 CrcA = 0;
+    UINT64 CrcB = 0;
+    UINT64 CrcC = 0;
+    UINTN  At;
+    UINT64 Sum = 0;
+    /*
+     * Layout-independent check: a chunked sum over the whole read buffer and over every byte the
+     * window received. Equal sums mean the image reached memory complete; a difference means the
+     * FAT read lost or mangled bytes long before the kernel runs. (The fixed-offset samples below
+     * only make sense for one segment layout; these two numbers do not depend on it.)
+     */
+    for (At = 0; At + 8 <= ImageSize; At += 8) {
+      UINT64 Word = ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + At));
+      Crc = (Crc * 0x100000001b3ULL) ^ Word;
+      /* Quarter sums name the damaged region without another round trip. */
+      if (At < ImageSize / 4) {
+        CrcA = (CrcA * 0x100000001b3ULL) ^ Word;
+      } else if (At < ImageSize / 2) {
+        CrcB = (CrcB * 0x100000001b3ULL) ^ Word;
+      } else if (At < (ImageSize / 4) * 3) {
+        CrcC = (CrcC * 0x100000001b3ULL) ^ Word;
+      }
+    }
+    for (At = 0; At < Kernel.Count; At++) {
+      UINT64 Left = Kernel.Segments[At].FileSize;
+      UINT8 *From = (UINT8 *)Image + Kernel.Segments[At].FileOffset;
+      UINT8 *To = (UINT8 *)(UINTN)(Address + Kernel.Segments[At].Address - Kernel.Base);
+      while (Left >= 8) {
+        Sum += ReadUnaligned64 ((CONST UINT64 *)From) ^ ReadUnaligned64 ((CONST UINT64 *)To);
+        From += 8; To += 8; Left -= 8;
+      }
+    }
+    /* The tail samples come first: the row 1/2 area stays clear of later firmware output. */
+    UnicodeSPrint (Probe, sizeof (Probe), L"E1 %lx %lx %lx",
+                   ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + ImageSize - 901120)),
+                   ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + ImageSize - 815432)),
+                   ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + ImageSize - 744680)));
+    DiagDraw (Probe, 1);
+    UnicodeSPrint (Probe, sizeof (Probe), L"E2 %lx %lx %lx",
+                   ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + ImageSize - 673928)),
+                   ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + ImageSize - 603176)),
+                   ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + ImageSize - 531888)));
+    DiagDraw (Probe, 2);
+    UnicodeSPrint (Probe, sizeof (Probe), L"CRC %lx bytes %lx segs %lx",
+                   Crc, (UINT64)ImageSize, (UINT64)Kernel.Count);
+    DiagDraw (Probe, 5);
+    UnicodeSPrint (Probe, sizeof (Probe), L"WINDOW delta %lx (0 = identical)",
+                   Sum);
+    DiagDraw (Probe, 6);
+    /*
+     * Find the first 64 KiB window where the read buffer disagrees with the copy that went into the
+     * kernel window. KernelSegments maps a file offset to both sides, so this needs no host
+     * reference: it names the offset where the FAT read stopped matching what it copied.
+     */
+    {
+      UINTN FirstBad = 0xFFFFFFFF;
+      UINTN BadCount = 0;
+      UINTN Seg;
+      for (Seg = 0; Seg < Kernel.Count; Seg++) {
+        UINT64 Left = Kernel.Segments[Seg].FileSize;
+        UINT8 *From = (UINT8 *)Image + Kernel.Segments[Seg].FileOffset;
+        UINT8 *To = (UINT8 *)(UINTN)(Address + Kernel.Segments[Seg].Address - Kernel.Base);
+        UINT64 FileOff = Kernel.Segments[Seg].FileOffset;
+        while (Left >= 0x10000) {
+          UINTN At2;
+          UINTN Same = 1;
+          for (At2 = 0; At2 < 0x10000; At2 += 8) {
+            if (ReadUnaligned64 ((CONST UINT64 *)(From + At2)) !=
+                ReadUnaligned64 ((CONST UINT64 *)(To + At2))) {
+              Same = 0;
+              break;
+            }
+          }
+          if (!Same) {
+            if (BadCount == 0) {
+              FirstBad = (UINTN)FileOff;
+            }
+            BadCount++;
+          }
+          From += 0x10000; To += 0x10000; Left -= 0x10000; FileOff += 0x10000;
+        }
+      }
+      UnicodeSPrint (Probe, sizeof (Probe), L"BAD off %lx n %lx", (UINT64)FirstBad, (UINT64)BadCount);
+      DiagDraw (Probe, 7);
+    }
+    /*
+     * Report physical ranges, rather than guessing file LBAs from an older
+     * FAT layout. ABL rewrites the initrd address in the live FDT.
+     */
+    {
+      UKE_MEM_STATUS *Mem = NULL;
+      EFI_STATUS MemStatus = EfiGetSystemConfigurationTable (&gUkeMemStatusGuid, (VOID **)&Mem);
+      if (!EFI_ERROR (MemStatus) && (Mem != NULL) && (Mem->Magic == UKE_MEM_STATUS_MAGIC)) {
+        UINT64 ImageBase = (UINT64)(UINTN)Image;
+        UINT64 Overlap = (ImageBase < Mem->InitrdEnd) && (Mem->InitrdStart < ImageBase + ImageSize);
+        UnicodeSPrint (Probe, sizeof (Probe), L"INITRD %lx-%lx", Mem->InitrdStart, Mem->InitrdEnd);
+        DiagDraw (Probe, 8);
+        UnicodeSPrint (Probe, sizeof (Probe), L"IMAGE %lx +%lx overlap %lx", ImageBase, (UINT64)ImageSize, Overlap);
+        DiagDraw (Probe, 9);
+        UnicodeSPrint (Probe, sizeof (Probe), L"FDT %lx +%lx WINDOW %lx", Mem->Dtb, Mem->DtbSize, Address);
+        DiagDraw (Probe, 10);
+      }
+    }
+    /* Continue immediately after diagnostics; the validated loader no longer needs a photo hold. */
   }
   FreePool (Image); Image = NULL;
   FreePool (Tree); Tree = NULL;
